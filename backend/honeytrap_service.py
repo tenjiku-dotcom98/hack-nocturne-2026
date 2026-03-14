@@ -18,6 +18,8 @@ import json
 import base64
 import hashlib
 import logging
+import subprocess
+import sys
 from typing import Any
 from urllib.parse import unquote, urlparse, urljoin
 
@@ -35,6 +37,7 @@ CHAT_REPLY_WAIT_MS = 1_200
 REQUEST_CONNECT_TIMEOUT_S = 4
 REQUEST_READ_TIMEOUT_S = 6
 MAX_REQUEST_CANDIDATES = 2
+PLAYWRIGHT_INSTALL_TIMEOUT_S = 180
 
 # ─── Regexes ──────────────────────────────────────────────────────────────────
 
@@ -218,6 +221,11 @@ def _merge_indicators(*dicts) -> dict[str, list[str]]:
 def _build_crawl_diagnostics(crawl_method: str, crawl_failures: list[str]) -> dict[str, Any]:
     text = "\n".join(crawl_failures).lower()
     playwright_missing = "no module named 'playwright'" in text
+    playwright_browser_missing = (
+        "browsertype.launch: executable doesn't exist" in text
+        or "please run the following command to download new browsers" in text
+        or "playwright install" in text and "chrome-linux" in text
+    )
     playwright_asyncio_conflict = "playwright sync api inside the asyncio loop" in text
     dns_failure = (
         "nameresolutionerror" in text
@@ -232,6 +240,8 @@ def _build_crawl_diagnostics(crawl_method: str, crawl_failures: list[str]) -> di
         likely_cause = "playwright_missing_and_dns_failure"
     elif playwright_missing:
         likely_cause = "playwright_missing"
+    elif playwright_browser_missing:
+        likely_cause = "playwright_browser_missing"
     elif playwright_asyncio_conflict:
         likely_cause = "playwright_asyncio_conflict"
     elif dns_failure:
@@ -244,6 +254,10 @@ def _build_crawl_diagnostics(crawl_method: str, crawl_failures: list[str]) -> di
     recommendations: list[str] = []
     if playwright_missing:
         recommendations.append("Install Playwright in backend venv and run 'python -m playwright install chromium'")
+    if playwright_browser_missing:
+        recommendations.append(
+            "Playwright browser binary is missing in the runtime environment; run 'python -m playwright install chromium' where the backend process actually runs (container/VM/server), then restart backend"
+        )
     if playwright_asyncio_conflict:
         recommendations.append("Playwright Sync API cannot run inside an asyncio loop; wrap the call with asyncio.to_thread()")
     if dns_failure:
@@ -257,6 +271,7 @@ def _build_crawl_diagnostics(crawl_method: str, crawl_failures: list[str]) -> di
         "method": crawl_method,
         "unreachable": unreachable,
         "playwrightMissing": playwright_missing,
+        "playwrightBrowserMissing": playwright_browser_missing,
         "playwrightAsyncioConflict": playwright_asyncio_conflict,
         "dnsFailure": dns_failure,
         "timeout": timeout_failure,
@@ -428,14 +443,47 @@ def _interact_via_telegram(telegram_id: str, persona: dict) -> list[dict]:
 
 # ─── Playwright crawl (upgraded) ─────────────────────────────────────────────
 
+def _is_playwright_browser_missing_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "browsertype.launch: executable doesn't exist" in text
+        or "please run the following command to download new browsers" in text
+    )
+
+
+def _install_playwright_chromium_runtime() -> None:
+    cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=PLAYWRIGHT_INSTALL_TIMEOUT_S,
+        check=False,
+    )
+    if completed.returncode != 0:
+        tail = "\n".join((completed.stderr or completed.stdout or "").splitlines()[-8:])
+        raise RuntimeError(f"Playwright chromium install failed in runtime env (code {completed.returncode}): {tail}")
+
+
+def _launch_chromium_with_recovery(playwright):
+    launch_args = {
+        "headless": True,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    try:
+        return playwright.chromium.launch(**launch_args)
+    except Exception as exc:
+        if not _is_playwright_browser_missing_error(exc):
+            raise
+        logger.warning("Playwright chromium executable missing in runtime; attempting in-process install and retry")
+        _install_playwright_chromium_runtime()
+        return playwright.chromium.launch(**launch_args)
+
 def _crawl_with_playwright(url: str, persona: dict) -> dict[str, Any]:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        browser = _launch_chromium_with_recovery(p)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
